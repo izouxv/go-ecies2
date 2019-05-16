@@ -162,11 +162,9 @@ func concatKDF(hash hash.Hash, z, s1 []byte, kdLen int) (k []byte, err error) {
 // messageTag computes the MAC of a message (called the tag) as per
 // SEC 1, 3.5.
 func messageTag(hash func() hash.Hash, km, msg, shared []byte) []byte {
-	if shared == nil {
-		shared = make([]byte, 0)
-	}
 	mac := hmac.New(hash, km)
 	mac.Write(msg)
+	mac.Write(shared)
 	tag := mac.Sum(nil)
 	return tag
 }
@@ -301,6 +299,10 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:rLen])
 	if R.X == nil {
 		err = ErrInvalidPublicKey
+		return
+	}
+	if !R.Curve.IsOnCurve(R.X, R.Y) {
+		err = ErrInvalidCurve
 		return
 	}
 
