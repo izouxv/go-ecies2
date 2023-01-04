@@ -7,16 +7,19 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"testing"
 )
 
-var dumpEnc bool
+var flDump = flag.Bool("dump", false, "write encrypted test message to file")
 
-func init() {
-	flDump := flag.Bool("dump", false, "write encrypted test message to file")
-	flag.Parse()
-	dumpEnc = *flDump
+func dumpEnc(out []byte) {
+	if *flDump {
+		f, _ := os.OpenFile("test.out", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		defer f.Close()
+		_, _ = f.Write(out)
+		_, _ = f.Write([]byte("\n"))
+	}
 }
 
 // Ensure the KDF generates appropriately sized keys.
@@ -38,19 +41,6 @@ func TestKDF(t *testing.T) {
 
 var skLen int
 var ErrBadSharedKeys = fmt.Errorf("ecies: shared keys don't match")
-
-// cmpParams compares a set of ECIES parameters. We assume, as per the
-// docs, that AES is the only supported symmetric encryption algorithm.
-func cmpParams(p1, p2 *ECIESParams) bool {
-	if p1.hashAlgo != p2.hashAlgo {
-		return false
-	} else if p1.KeyLen != p2.KeyLen {
-		return false
-	} else if p1.BlockSize != p2.BlockSize {
-		return false
-	}
-	return true
-}
 
 // cmpPublic returns true if the two public keys represent the same pojnt.
 func cmpPublic(pub1, pub2 PublicKey) bool {
@@ -183,10 +173,7 @@ func TestMarshalPrivate(t *testing.T) {
 		fmt.Println(err.Error())
 		t.FailNow()
 	}
-
-	if dumpEnc {
-		ioutil.WriteFile("test.out", out, 0644)
-	}
+	dumpEnc(out)
 
 	prv2, err := UnmarshalPrivate(out)
 	if err != nil {
@@ -214,10 +201,7 @@ func TestPrivatePEM(t *testing.T) {
 		fmt.Println(err.Error())
 		t.FailNow()
 	}
-
-	if dumpEnc {
-		ioutil.WriteFile("test.key", out, 0644)
-	}
+	dumpEnc(out)
 
 	prv2, err := ImportPrivatePEM(out)
 	if err != nil {
@@ -243,10 +227,7 @@ func TestPublicPEM(t *testing.T) {
 		fmt.Println(err.Error())
 		t.FailNow()
 	}
-
-	if dumpEnc {
-		ioutil.WriteFile("test.pem", out, 0644)
-	}
+	dumpEnc(out)
 
 	pub2, err := ImportPublicPEM(out)
 	if err != nil {
