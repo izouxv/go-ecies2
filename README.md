@@ -24,6 +24,7 @@ Note: If one wants to use the Koblitz curves with this package, their minimal im
 found in e.g. https://github.com/decred/dcrd/blob/master/dcrec/secp256k1/ellipticadaptor.go.
 
 The default symmetric cipher and hash parameters are the following:
+
     +-------+-------------+---------+--------------+
     | Curve |    Cipher   |  Hash   |   Auth Tag   |
     +-------+-------------+---------+--------------+
