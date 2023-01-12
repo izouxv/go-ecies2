@@ -256,31 +256,29 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 	}
 	hash := params.Hash()
 
-	var (
-		rLen   int
-		hLen   int = hash.Size()
-		mStart int
-		mEnd   int
-	)
-
+	var kLen, hLen, mStart, mEnd int
+	hLen = hash.Size()
+	kLen = (prv.PublicKey.Curve.Params().BitSize + 7) / 8
 	switch c[0] {
-	case 2, 3, 4:
-		rLen = ((prv.PublicKey.Curve.Params().BitSize + 7) / 4)
-		if len(c) < (rLen + hLen + 1) {
-			err = ErrInvalidMessage
-			return
-		}
+	case 2, 3:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L147
+		mStart = 1 + kLen
+	case 4:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L120
+		mStart = 1 + 2*kLen
 	default:
 		err = ErrInvalidPublicKey
 		return
 	}
-
-	mStart = rLen
+	if len(c) < (mStart + hLen + 1) {
+		err = ErrInvalidMessage
+		return
+	}
 	mEnd = len(c) - hLen
 
 	R := new(PublicKey)
 	R.Curve = prv.PublicKey.Curve
-	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:rLen])
+	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:mStart])
 	if R.X == nil {
 		err = ErrInvalidPublicKey
 		return
