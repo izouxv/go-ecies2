@@ -5,8 +5,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"math/big"
+	pseudorand "math/rand"
 	"os"
 	"testing"
 )
@@ -20,6 +24,24 @@ func dumpEnc(out []byte) {
 		_, _ = f.Write(out)
 		_, _ = f.Write([]byte("\n"))
 	}
+}
+
+func curveFromName(name string) elliptic.Curve {
+	for curve := range paramsFromCurve {
+		if curve.Params().Name == name {
+			return curve
+		}
+	}
+	return nil
+}
+
+func bigIntToStr(i *big.Int) string {
+	return i.Text(62)
+}
+
+func strToBigInt(s string) *big.Int {
+	i, _ := new(big.Int).SetString(s, 62)
+	return i
 }
 
 // Ensure the KDF generates appropriately sized keys.
@@ -72,33 +94,123 @@ func cmpPrivate(prv1, prv2 *PrivateKey) bool {
 
 // Validate the ECDH component.
 func TestSharedKey(t *testing.T) {
-	prv1, err := GenerateKey(rand.Reader, DefaultCurve, nil)
+	for c := range paramsFromCurve {
+		testSharedKey(t, c)
+	}
+}
+
+func testSharedKey(t *testing.T, curve elliptic.Curve) {
+	name := curve.Params().Name
+	prv1, err := GenerateKey(rand.Reader, curve, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, err.Error())
 		t.FailNow()
 	}
 
-	prv2, err := GenerateKey(rand.Reader, DefaultCurve, nil)
+	prv2, err := GenerateKey(rand.Reader, curve, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, err.Error())
 		t.FailNow()
 	}
 
 	sk1, err := prv1.GenerateShared(&prv2.PublicKey)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, err.Error())
 		t.FailNow()
+	}
+
+	if *flDump {
+		dumpEnc([]byte(fmt.Sprintf(
+			`gen-shared-1:
+  Curve: %s
+  Private:
+    PX: "%s"
+    PY: "%s"
+    PD: "%s"
+  Public:
+    PX: "%s"
+    PY: "%s"
+  Shared: "%s"`,
+			name,
+			bigIntToStr(prv1.X),
+			bigIntToStr(prv1.Y),
+			bigIntToStr(prv1.D),
+			bigIntToStr(prv2.X),
+			bigIntToStr(prv2.Y),
+			hex.EncodeToString(sk1),
+		)))
 	}
 
 	sk2, err := prv2.GenerateShared(&prv1.PublicKey)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, err.Error())
 		t.FailNow()
 	}
 
 	if !bytes.Equal(sk1, sk2) {
-		fmt.Println(ErrBadSharedKeys.Error())
+		fmt.Println(name, ErrBadSharedKeys.Error())
 		t.FailNow()
+	}
+}
+
+func TestVectorSharedKey(t *testing.T) {
+	var testVectors map[string]struct {
+		Curve   string
+		Private struct {
+			PX string
+			PY string
+			PD string
+		}
+		Public struct {
+			PX string
+			PY string
+		}
+		Shared string
+	}
+	testData, err := os.ReadFile("test-vectors/gen-shared.json")
+	if err != nil {
+		fmt.Println(err.Error())
+		t.FailNow()
+	}
+	if err := json.Unmarshal(testData, &testVectors); err != nil {
+		fmt.Println(err.Error())
+		t.FailNow()
+	}
+
+	for name, vector := range testVectors {
+		curve := curveFromName(vector.Curve)
+		if curve == nil {
+			fmt.Println(name, ErrInvalidCurve.Error())
+			t.FailNow()
+		}
+		prv := PrivateKey{
+			PublicKey: PublicKey{
+				Curve: curve,
+				X:     strToBigInt(vector.Private.PX),
+				Y:     strToBigInt(vector.Private.PY),
+			},
+			D: strToBigInt(vector.Private.PD),
+		}
+		pub := PublicKey{
+			Curve: curve,
+			X:     strToBigInt(vector.Public.PX),
+			Y:     strToBigInt(vector.Public.PY),
+		}
+		sk, _ := hex.DecodeString(vector.Shared)
+		if prv.X == nil || prv.Y == nil || prv.D == nil || pub.X == nil || pub.Y == nil || sk == nil {
+			fmt.Println(name, "invalid BigInt in test vector")
+			t.FailNow()
+		}
+
+		skGen, err := prv.GenerateShared(&pub)
+		if err != nil {
+			fmt.Println(name, err.Error())
+			t.FailNow()
+		}
+		if !bytes.Equal(sk, skGen) {
+			fmt.Println(name, ErrBadSharedKeys.Error())
+			t.FailNow()
+		}
 	}
 }
 
@@ -288,40 +400,166 @@ func BenchmarkDecrypt1KbP256(b *testing.B) {
 
 // Verify that an encrypted message can be successfully decrypted.
 func TestEncryptDecrypt(t *testing.T) {
-	prv1, err := GenerateKey(rand.Reader, DefaultCurve, nil)
+	// Test a total of 10 static & random message across all curves.
+	messages := [][]byte{
+		[]byte{0},
+		[]byte("Hello, world!"),
+		[]byte("The quick brown fox jumps over the lazy dog."),
+	}
+	for i := 0; i < 7; i++ {
+		messages = append(messages, make([]byte, 10+i*15))
+		_, _ = rand.Read(messages[len(messages)-1])
+	}
+
+	i := 1
+	for c := range paramsFromCurve {
+		for _, m := range messages {
+			testEncryptDecrypt(t, c, m, i)
+			i++
+			if *flDump {
+				// Re-run the same input values with a different random seed
+				testEncryptDecrypt(t, c, m, i)
+				i++
+			}
+		}
+	}
+}
+
+func testEncryptDecrypt(t *testing.T, curve elliptic.Curve, msg []byte, idx int) {
+	name := curve.Params().Name
+	prv1, err := GenerateKey(rand.Reader, curve, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, len(msg), err.Error())
 		t.FailNow()
 	}
 
-	prv2, err := GenerateKey(rand.Reader, DefaultCurve, nil)
+	prv2, err := GenerateKey(rand.Reader, curve, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, len(msg), err.Error())
 		t.FailNow()
 	}
 
-	message := []byte("Hello, world.")
-	ct, err := Encrypt(rand.Reader, &prv2.PublicKey, message, nil, nil)
+	var seed int64
+	nonseReader := rand.Reader
+	if *flDump {
+		maxSeed := new(big.Int).SetInt64(1<<32 - 1)
+		bigSeed, _ := rand.Int(rand.Reader, maxSeed)
+		seed = bigSeed.Int64()
+		nonseReader = pseudorand.New(pseudorand.NewSource(seed))
+	}
+
+	ct, err := Encrypt(nonseReader, &prv2.PublicKey, msg, nil, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, len(msg), "encrypt error", err.Error())
 		t.FailNow()
 	}
 
-	pt, err := prv2.Decrypt(rand.Reader, ct, nil, nil)
+	if *flDump {
+		dumpEnc([]byte(fmt.Sprintf(
+			`gen-encrypt-decrypt-%d:
+  Curve: %s
+  Seed: %d
+  Private:
+    PX: %s
+    PY: %s
+    PD: %s
+  Message:
+    Dec: "%s"
+    Enc: "%s"`,
+			idx,
+			name,
+			seed,
+			bigIntToStr(prv2.X),
+			bigIntToStr(prv2.Y),
+			bigIntToStr(prv2.D),
+			hex.EncodeToString(msg),
+			hex.EncodeToString(ct),
+		)))
+	}
+
+	pt, err := prv2.Decrypt(nil, ct, nil, nil)
 	if err != nil {
-		fmt.Println(err.Error())
+		fmt.Println(name, len(msg), "decrypt error", err.Error())
 		t.FailNow()
 	}
 
-	if !bytes.Equal(pt, message) {
-		fmt.Println("ecies: plaintext doesn't match message")
+	if !bytes.Equal(pt, msg) {
+		fmt.Println(name, len(msg), "ecies: plaintext doesn't match message")
 		t.FailNow()
 	}
 
-	_, err = prv1.Decrypt(rand.Reader, ct, nil, nil)
+	_, err = prv1.Decrypt(nil, ct, nil, nil)
 	if err == nil {
-		fmt.Println("ecies: encryption should not have succeeded")
+		fmt.Println(name, len(msg), "ecies: encryption should not have succeeded")
 		t.FailNow()
+	}
+}
+
+func TestVectorEncryptDecrypt(t *testing.T) {
+	var testVectors map[string]struct {
+		Curve   string
+		Seed    int64
+		Private struct {
+			PX string
+			PY string
+			PD string
+		}
+		Message struct {
+			Enc string
+			Dec string
+		}
+	}
+	testData, err := os.ReadFile("test-vectors/encrypt-decrypt.json")
+	if err != nil {
+		fmt.Println(err.Error())
+		t.FailNow()
+	}
+	if err := json.Unmarshal(testData, &testVectors); err != nil {
+		fmt.Println(err.Error())
+		t.FailNow()
+	}
+
+	for name, vector := range testVectors {
+		curve := curveFromName(vector.Curve)
+		nonseReader := pseudorand.New(pseudorand.NewSource(vector.Seed))
+		if curve == nil {
+			fmt.Println(name, ErrInvalidCurve.Error())
+			t.FailNow()
+		}
+		prv := PrivateKey{
+			PublicKey: PublicKey{
+				Curve: curve,
+				X:     strToBigInt(vector.Private.PX),
+				Y:     strToBigInt(vector.Private.PY),
+			},
+			D: strToBigInt(vector.Private.PD),
+		}
+		dec, _ := hex.DecodeString(vector.Message.Dec)
+		enc, _ := hex.DecodeString(vector.Message.Enc)
+		if prv.X == nil || prv.Y == nil || prv.D == nil || enc == nil || dec == nil {
+			fmt.Println(name, "invalid BigInt in test vector")
+			t.FailNow()
+		}
+
+		ct, err := Encrypt(nonseReader, &prv.PublicKey, dec, nil, nil)
+		if err != nil {
+			fmt.Println(name, err.Error())
+			t.FailNow()
+		}
+		if !bytes.Equal(ct, enc) {
+			fmt.Println(name, "ecies: encrypted doesn't match vector", hex.EncodeToString(ct))
+			t.FailNow()
+		}
+
+		pt, err := prv.Decrypt(nil, enc, nil, nil)
+		if err != nil {
+			fmt.Println(name, err.Error())
+			t.FailNow()
+		}
+		if !bytes.Equal(pt, dec) {
+			fmt.Println(name, "ecies: decrypted doesn't match vector", hex.EncodeToString(pt))
+			t.FailNow()
+		}
 	}
 }
 
