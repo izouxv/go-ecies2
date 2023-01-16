@@ -39,7 +39,6 @@ func TestKDF(t *testing.T) {
 	}
 }
 
-var skLen int
 var ErrBadSharedKeys = fmt.Errorf("ecies: shared keys don't match")
 
 // cmpPublic returns true if the two public keys represent the same pojnt.
@@ -78,7 +77,6 @@ func TestSharedKey(t *testing.T) {
 		fmt.Println(err.Error())
 		t.FailNow()
 	}
-	skLen = MaxSharedKeyLength(&prv1.PublicKey) / 2
 
 	prv2, err := GenerateKey(rand.Reader, DefaultCurve, nil)
 	if err != nil {
@@ -86,13 +84,13 @@ func TestSharedKey(t *testing.T) {
 		t.FailNow()
 	}
 
-	sk1, err := prv1.GenerateShared(&prv2.PublicKey, skLen, skLen)
+	sk1, err := prv1.GenerateShared(&prv2.PublicKey)
 	if err != nil {
 		fmt.Println(err.Error())
 		t.FailNow()
 	}
 
-	sk2, err := prv2.GenerateShared(&prv1.PublicKey, skLen, skLen)
+	sk2, err := prv2.GenerateShared(&prv1.PublicKey)
 	if err != nil {
 		fmt.Println(err.Error())
 		t.FailNow()
@@ -100,34 +98,6 @@ func TestSharedKey(t *testing.T) {
 
 	if !bytes.Equal(sk1, sk2) {
 		fmt.Println(ErrBadSharedKeys.Error())
-		t.FailNow()
-	}
-}
-
-// Verify that the key generation code fails when too much key data is
-// requested.
-func TestTooBigSharedKey(t *testing.T) {
-	prv1, err := GenerateKey(rand.Reader, DefaultCurve, nil)
-	if err != nil {
-		fmt.Println(err.Error())
-		t.FailNow()
-	}
-
-	prv2, err := GenerateKey(rand.Reader, DefaultCurve, nil)
-	if err != nil {
-		fmt.Println(err.Error())
-		t.FailNow()
-	}
-
-	_, err = prv1.GenerateShared(&prv2.PublicKey, skLen*2, skLen*2)
-	if err != ErrSharedKeyTooBig {
-		fmt.Println("ecdh: shared key should be too large for curve")
-		t.FailNow()
-	}
-
-	_, err = prv2.GenerateShared(&prv1.PublicKey, skLen*2, skLen*2)
-	if err != ErrSharedKeyTooBig {
-		fmt.Println("ecdh: shared key should be too large for curve")
 		t.FailNow()
 	}
 }
@@ -258,7 +228,7 @@ func BenchmarkGenSharedKeyP256(b *testing.B) {
 	}
 
 	for i := 0; i < b.N; i++ {
-		_, err := prv.GenerateShared(&prv.PublicKey, skLen, skLen)
+		_, err := prv.GenerateShared(&prv.PublicKey)
 		if err != nil {
 			fmt.Println(err.Error())
 			b.FailNow()

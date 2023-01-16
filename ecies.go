@@ -82,28 +82,18 @@ func GenerateKey(rand io.Reader, curve elliptic.Curve, params *ECIESParams) (prv
 	return
 }
 
-// MaxSharedKeyLength returns the maximum length of the shared key the public key can produce.
-func MaxSharedKeyLength(pub *PublicKey) int {
-	return (pub.Curve.Params().BitSize + 7) / 8
-}
-
-// ECDH key agreement method used to establish secret keys for encryption.
-func (prv *PrivateKey) GenerateShared(pub *PublicKey, skLen, macLen int) (sk []byte, err error) {
+// SEC 1 section 3.3.1: ECDH key agreement method used to establish secret keys for encryption.
+func (prv *PrivateKey) GenerateShared(pub *PublicKey) ([]byte, error) {
 	if prv.PublicKey.Curve != pub.Curve {
 		return nil, ErrInvalidCurve
-	}
-	if skLen+macLen > MaxSharedKeyLength(pub) {
-		return nil, ErrSharedKeyTooBig
 	}
 	x, _ := pub.Curve.ScalarMult(pub.X, pub.Y, prv.D.Bytes())
 	if x == nil {
 		return nil, ErrSharedKeyIsPointAtInfinity
 	}
 
-	sk = make([]byte, skLen+macLen)
-	skBytes := x.Bytes()
-	copy(sk[len(sk)-len(skBytes):], skBytes)
-	return sk, nil
+	out := make([]byte, (pub.Curve.Params().BitSize+7)/8)
+	return x.FillBytes(out), nil
 }
 
 var (
@@ -222,7 +212,7 @@ func Encrypt(rand io.Reader, pub *PublicKey, m, s1, s2 []byte) (ct []byte, err e
 	}
 
 	hash := params.Hash()
-	z, err := R.GenerateShared(pub, params.KeyLen, params.KeyLen)
+	z, err := R.GenerateShared(pub)
 	if err != nil {
 		return
 	}
@@ -266,31 +256,29 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 	}
 	hash := params.Hash()
 
-	var (
-		rLen   int
-		hLen   int = hash.Size()
-		mStart int
-		mEnd   int
-	)
-
+	var kLen, hLen, mStart, mEnd int
+	hLen = hash.Size()
+	kLen = (prv.PublicKey.Curve.Params().BitSize + 7) / 8
 	switch c[0] {
-	case 2, 3, 4:
-		rLen = ((prv.PublicKey.Curve.Params().BitSize + 7) / 4)
-		if len(c) < (rLen + hLen + 1) {
-			err = ErrInvalidMessage
-			return
-		}
+	case 2, 3:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L147
+		mStart = 1 + kLen
+	case 4:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L120
+		mStart = 1 + 2*kLen
 	default:
 		err = ErrInvalidPublicKey
 		return
 	}
-
-	mStart = rLen
+	if len(c) < (mStart + hLen + 1) {
+		err = ErrInvalidMessage
+		return
+	}
 	mEnd = len(c) - hLen
 
 	R := new(PublicKey)
 	R.Curve = prv.PublicKey.Curve
-	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:rLen])
+	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:mStart])
 	if R.X == nil {
 		err = ErrInvalidPublicKey
 		return
@@ -300,7 +288,7 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 		return
 	}
 
-	z, err := prv.GenerateShared(R, params.KeyLen, params.KeyLen)
+	z, err := prv.GenerateShared(R)
 	if err != nil {
 		return
 	}
