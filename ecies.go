@@ -1,6 +1,7 @@
 package ecies
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -159,15 +160,6 @@ func concatKDF(hash hash.Hash, z, s1 []byte, kdLen int) (k []byte, err error) {
 	return
 }
 
-// messageTag computes the MAC of a message (called the tag) as per SEC 1, 3.5.
-func messageTag(hash func() hash.Hash, km, msg, shared []byte) []byte {
-	mac := hmac.New(hash, km)
-	mac.Write(msg)
-	mac.Write(shared)
-	tag := mac.Sum(nil)
-	return tag
-}
-
 // Generate an initialisation vector for CTR mode.
 func generateIV(params *ECIESParams, rand io.Reader) (iv []byte, err error) {
 	iv = make([]byte, params.BlockSize)
@@ -175,8 +167,12 @@ func generateIV(params *ECIESParams, rand io.Reader) (iv []byte, err error) {
 	return
 }
 
+func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err error) {
+	return Decrypt(prv, c, s1, s2)
+}
+
 // symEncrypt carries out CTR encryption using the block cipher specified in the parameters.
-func symEncrypt(rand io.Reader, params *ECIESParams, key, m []byte) (ct []byte, err error) {
+func symEncrypt(rand io.Reader, params *ECIESParams, key []byte, m io.Reader, w io.Writer, sum hash.Hash) (err error) {
 	c, err := params.Cipher(key)
 	if err != nil {
 		return
@@ -186,31 +182,193 @@ func symEncrypt(rand io.Reader, params *ECIESParams, key, m []byte) (ct []byte, 
 	if err != nil {
 		return
 	}
-	ctr := cipher.NewCTR(c, iv)
 
-	ct = make([]byte, len(m)+params.BlockSize)
-	copy(ct, iv)
-	ctr.XORKeyStream(ct[params.BlockSize:], m)
+	w.Write(iv)
+	sum.Write(iv)
+
+	cw := &ctrHashWriter{ctr: cipher.NewCTR(c, iv), sum: sum, w: w, encode: true}
+	_, err = io.Copy(cw, m)
 	return
 }
 
-// symDecrypt carries out CTR decryption using the block cipher specified in the parameters
-func symDecrypt(params *ECIESParams, key, ct []byte) (m []byte, err error) {
+var _ io.Writer = (*ctrHashWriter)(nil)
+
+type ctrHashWriter struct {
+	w      io.Writer
+	sum    hash.Hash
+	ctr    cipher.Stream
+	encode bool
+}
+
+func (g *ctrHashWriter) Write(p []byte) (n int, err error) {
+	p2 := make([]byte, len(p))
+
+	if !g.encode {
+		// Decryption: write original ciphertext to MAC before decrypting
+		g.sum.Write(p)
+		g.ctr.XORKeyStream(p2, p)
+	} else {
+		// Encryption: encrypt and then write ciphertext to MAC
+		g.ctr.XORKeyStream(p2, p)
+		g.sum.Write(p2)
+	}
+
+	n, err = g.w.Write(p2)
+	if err != nil {
+		return n, fmt.Errorf("ctr writer err: %v", err)
+	}
+
+	return n, err
+}
+
+// Encrypt encrypts a message using ECIES as specified in SEC 1, 5.1. If
+// the shared information parameters aren't being used, they should be nil.
+func Decrypt(prv KeyProvider, c, s1, s2 []byte) (m []byte, err error) {
+	rbuf := bytes.NewBuffer(c)
+	wbuf := bytes.NewBuffer(nil)
+	err = DecryptIO(prv, rbuf, len(c), wbuf, s1, s2)
+	if err != nil {
+		return nil, err
+	}
+	m = wbuf.Bytes()
+	return
+}
+
+func DecryptIO(prv KeyProvider, c io.Reader, cSize int, w io.Writer, s1, s2 []byte) (err error) {
+	if cSize == 0 {
+		err = ErrInvalidMessage
+		return
+	}
+	pub := prv.Public()
+	params := pub.Params
+	if params == nil {
+		if params = ParamsFromCurve(pub.Curve); params == nil {
+			err = ErrUnsupportedECIESParameters
+			return
+		}
+	}
+	hash := params.Hash()
+
+	var c_0 = make([]byte, 1)
+	if _, err = c.Read(c_0); err != nil {
+		return err
+	}
+
+	var kLen, hLen, mStart, mEnd int
+	hLen = hash.Size()
+	kLen = (pub.Curve.Params().BitSize + 7) / 8
+	switch c_0[0] {
+	case 2, 3:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L147
+		mStart = 1 + kLen
+	case 4:
+		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L120
+		mStart = 1 + 2*kLen
+	default:
+		err = ErrInvalidPublicKey
+		return
+	}
+	if cSize < (mStart + hLen + 1) {
+		err = ErrInvalidMessage
+		return
+	}
+	mEnd = cSize - hLen // This is the start of the MAC tag.
+
+	var cmStart = make([]byte, mStart)
+	cmStart[0] = c_0[0]
+	if _, err = c.Read(cmStart[1:]); err != nil {
+		return err
+	}
+
+	R := new(PublicKey)
+	R.Curve = pub.Curve
+	R.X, R.Y = elliptic.Unmarshal(R.Curve, cmStart)
+	if R.X == nil {
+		err = ErrInvalidPublicKey
+		return
+	}
+	if !R.Curve.IsOnCurve(R.X, R.Y) {
+		err = ErrInvalidCurve
+		return
+	}
+
+	z, err := prv.GenerateShared(R)
+	if err != nil {
+		return
+	}
+
+	K, err := concatKDF(hash, z, s1, params.KeyLen+params.KeyLen)
+	if err != nil {
+		return
+	}
+
+	Ke := K[:params.KeyLen]
+	Km := K[params.KeyLen:]
+	hash.Write(Km)
+	Km = hash.Sum(nil)
+	hash.Reset()
+
+	cBodyLen := mEnd - mStart // This is the length of the encrypted message part (em).
+
+	sum := hmac.New(params.Hash, Km)
+	lastSum, err := symDecrypt(params, Ke, c, cBodyLen, w, sum)
+	if err != nil {
+		return
+	}
+
+	sum.Write(s2)
+
+	d := sum.Sum(nil)
+	if subtle.ConstantTimeCompare(lastSum, d) != 1 {
+		err = ErrInvalidMessage
+		return
+	}
+
+	return
+
+}
+
+func symDecrypt(params *ECIESParams, key []byte, r io.Reader, rLength int, w io.Writer, sum hash.Hash) (lastSum []byte, err error) {
 	c, err := params.Cipher(key)
 	if err != nil {
 		return
 	}
 
-	ctr := cipher.NewCTR(c, ct[:params.BlockSize])
+	var iv = make([]byte, params.BlockSize)
+	if _, err = r.Read(iv); err != nil {
+		return nil, err
+	}
+	sum.Write(iv)
 
-	m = make([]byte, len(ct)-params.BlockSize)
-	ctr.XORKeyStream(m, ct[params.BlockSize:])
+	// The reader for the encrypted message, which is rLength bytes long.
+	// It excludes the IV (already read) and the MAC tag (at the end).
+	rLength -= len(iv)
+	lr := io.LimitReader(r, int64(rLength))
+
+	cw := &ctrHashWriter{ctr: cipher.NewCTR(c, iv), sum: sum, w: w, encode: false}
+	_, err = io.Copy(cw, lr)
+	if err != nil {
+		return nil, err
+	}
+
+	// After reading the encrypted message, the rest of the reader is the MAC tag.
+	lastSum, err = io.ReadAll(r)
+
 	return
 }
 
-// Encrypt encrypts a message using ECIES as specified in SEC 1, 5.1. If
-// the shared information parameters aren't being used, they should be nil.
 func Encrypt(rand io.Reader, pub *PublicKey, m, s1, s2 []byte) (ct []byte, err error) {
+	rbuf := bytes.NewBuffer(m)
+	wbuf := bytes.NewBuffer(nil)
+	err = EncryptIO(rand, pub, rbuf, wbuf, s1, s2)
+	if err != nil {
+		return nil, err
+	}
+	ct = wbuf.Bytes()
+	return
+}
+
+func EncryptIO(rand io.Reader, pub *PublicKey, m io.Reader, w io.Writer, s1, s2 []byte) (err error) {
 	params := pub.Params
 	if params == nil {
 		if params = ParamsFromCurve(pub.Curve); params == nil {
@@ -238,96 +396,18 @@ func Encrypt(rand io.Reader, pub *PublicKey, m, s1, s2 []byte) (ct []byte, err e
 	Km = hash.Sum(nil)
 	hash.Reset()
 
-	em, err := symEncrypt(rand, params, Ke, m)
-	if err != nil || len(em) <= params.BlockSize {
-		return
-	}
-
-	d := messageTag(params.Hash, Km, em, s2)
-
 	Rb := elliptic.Marshal(pub.Curve, R.PublicKey.X, R.PublicKey.Y)
-	ct = make([]byte, len(Rb)+len(em)+len(d))
-	copy(ct, Rb)
-	copy(ct[len(Rb):], em)
-	copy(ct[len(Rb)+len(em):], d)
-	return
-}
+	w.Write(Rb)
 
-// Deprecated: backward-compatible Decrypt method
-func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err error) {
-	return Decrypt(prv, c, s1, s2)
-}
-
-// Decrypt decrypts an ECIES ciphertext.
-func Decrypt(prv KeyProvider, c, s1, s2 []byte) (m []byte, err error) {
-	if len(c) == 0 {
-		err = ErrInvalidMessage
-		return
-	}
-	pub := prv.Public()
-	params := pub.Params
-	if params == nil {
-		if params = ParamsFromCurve(pub.Curve); params == nil {
-			err = ErrUnsupportedECIESParameters
-			return
-		}
-	}
-	hash := params.Hash()
-
-	var kLen, hLen, mStart, mEnd int
-	hLen = hash.Size()
-	kLen = (pub.Curve.Params().BitSize + 7) / 8
-	switch c[0] {
-	case 2, 3:
-		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L147
-		mStart = 1 + kLen
-	case 4:
-		// https://github.com/golang/go/blob/go1.19.5/src/crypto/elliptic/elliptic.go#L120
-		mStart = 1 + 2*kLen
-	default:
-		err = ErrInvalidPublicKey
-		return
-	}
-	if len(c) < (mStart + hLen + 1) {
-		err = ErrInvalidMessage
-		return
-	}
-	mEnd = len(c) - hLen
-
-	R := new(PublicKey)
-	R.Curve = pub.Curve
-	R.X, R.Y = elliptic.Unmarshal(R.Curve, c[:mStart])
-	if R.X == nil {
-		err = ErrInvalidPublicKey
-		return
-	}
-	if !R.Curve.IsOnCurve(R.X, R.Y) {
-		err = ErrInvalidCurve
-		return
-	}
-
-	z, err := prv.GenerateShared(R)
+	sum := hmac.New(params.Hash, Km)
+	err = symEncrypt(rand, params, Ke, m, w, sum)
 	if err != nil {
 		return
 	}
+	sum.Write(s2)
 
-	K, err := concatKDF(hash, z, s1, params.KeyLen+params.KeyLen)
-	if err != nil {
-		return
-	}
+	d := sum.Sum(nil)
+	w.Write(d)
 
-	Ke := K[:params.KeyLen]
-	Km := K[params.KeyLen:]
-	hash.Write(Km)
-	Km = hash.Sum(nil)
-	hash.Reset()
-
-	d := messageTag(params.Hash, Km, c[mStart:mEnd], s2)
-	if subtle.ConstantTimeCompare(c[mEnd:], d) != 1 {
-		err = ErrInvalidMessage
-		return
-	}
-
-	m, err = symDecrypt(params, Ke, c[mStart:mEnd])
 	return
 }
